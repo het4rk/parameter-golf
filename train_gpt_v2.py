@@ -64,7 +64,7 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 11))  # Changed: 11 from 10
+    num_layers = int(os.environ.get("NUM_LAYERS", 10))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -92,7 +92,7 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
 
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
 
     # EMA (replaces SWA) - multiple decays, pick best at export
@@ -108,7 +108,7 @@ class Hyperparameters:
     # XSA config: number of trailing layers with XSA (0 = disable)
     xsa_num_layers = int(os.environ.get("XSA_NUM_LAYERS", 4))
     # Mixed quantization: int7 for XSA layers
-    int7_layer_start = int(os.environ.get("INT7_LAYER_START", 8))
+    int7_layer_start = int(os.environ.get("INT7_LAYER_START", 99))  # 99 = disabled (uniform int6 attn)
 
     # Cosine annealing
     cosine_min_ratio = float(os.environ.get("COSINE_MIN_RATIO", 0.05))
