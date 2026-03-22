@@ -209,18 +209,16 @@ class Muon(torch.optim.Optimizer):
 # -----------------------------
 
 class STEFakeQuantize(torch.autograd.Function):
-    """Straight-through estimator for fake quantization during training.
-    Uses per-row max clipping to match export quantization exactly."""
+    """STE for int6 fake quantization matching export (multiples-of-4 in int8)."""
     @staticmethod
     def forward(ctx, x: Tensor, clip_range: int) -> Tensor:
         if x.ndim < 2:
             return x
-        # Use per-row max clipping to match quantize_intN_per_row in export
-        row_max = x.abs().amax(dim=-1, keepdim=True)
-        clip_abs = row_max.clamp_min(1e-12)
-        x_clipped = torch.clamp(x, -clip_abs, clip_abs)
-        scale = (clip_abs / clip_range).clamp_min(1e-12)
-        q = torch.clamp(torch.round(x_clipped / scale), -(clip_range + 1), clip_range)
+        # Match quantize_int6_per_row: scale to [-127,127], round to multiples of 4
+        row_max = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+        scale = row_max / 127.0
+        q_raw = torch.round(x / scale)
+        q = (torch.round(q_raw / 4) * 4).clamp(-128, 124)
         return q * scale
 
     @staticmethod
@@ -363,57 +361,22 @@ def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
 
-def quantize_intN_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
-    """Quantize a tensor to intN using per-row max scaling."""
+def quantize_int6_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
+    """Int6 quantization stored as multiples-of-4 in int8 for better zstd compression.
+    64 unique values: -128, -124, ..., -4, 0, 4, ..., 120, 124.
+    Lowest 2 bits always 00 = ~25% better zstd compression vs raw int8."""
     t32 = t.float()
     if t32.ndim == 2:
-        row_max = t32.abs().amax(dim=1)
-        scale = (row_max / clip_range).clamp_min(1e-12).to(torch.float16)
-        scale = scale.clamp_min(torch.finfo(torch.float16).tiny)
-        q = torch.clamp(torch.round(t32 / scale.float()[:, None]), -(clip_range + 1), clip_range).to(torch.int8)
+        row_max = t32.abs().amax(dim=1).clamp_min(1e-12)
+        scale = (row_max / 127.0).clamp_min(1e-12).to(torch.float16)
+        q_raw = torch.round(t32 / scale.float()[:, None])
+        q = (torch.round(q_raw / 4) * 4).clamp(-128, 124).to(torch.int8)
         return q, scale
-    amax = t32.abs().max().item()
-    scale = torch.tensor(max(amax / clip_range, 1e-12), dtype=torch.float16)
-    q = torch.clamp(torch.round(t32 / scale.float()), -(clip_range + 1), clip_range).to(torch.int8)
+    amax = max(t32.abs().max().item(), 1e-12)
+    scale = torch.tensor(amax / 127.0, dtype=torch.float16)
+    q_raw = torch.round(t32 / scale.float())
+    q = (torch.round(q_raw / 4) * 4).clamp(-128, 124).to(torch.int8)
     return q, scale
-
-
-def quantize_intN_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
-    """GPTQ-lite: For each row, try multiple clip percentiles and pick the one with minimum MSE.
-    This is zero cost during training, small cost during export."""
-    t32 = t.float()
-    if t32.ndim != 2:
-        return quantize_intN_per_row(t32, clip_range)
-
-    percentiles = [99.5, 99.9, 99.95, 99.99, 99.999]
-    best_q = None
-    best_scale = None
-    best_mse = None
-
-    for pct in percentiles:
-        q_val = pct / 100.0
-        clip_abs = torch.quantile(t32.abs(), q_val, dim=1)
-        clip_abs = clip_abs.clamp_min(1e-12)
-        scale = (clip_abs / clip_range).clamp_min(1e-12).to(torch.float16)
-        scale_f = scale.float()
-        clipped = torch.clamp(t32, -clip_abs[:, None], clip_abs[:, None])
-        q = torch.clamp(torch.round(clipped / scale_f[:, None]), -(clip_range + 1), clip_range).to(torch.int8)
-        deq = q.float() * scale_f[:, None]
-        mse = (t32 - deq).pow(2).mean(dim=1)
-
-        if best_mse is None:
-            best_q = q
-            best_scale = scale
-            best_mse = mse
-        else:
-            # Per-row: pick whichever percentile gave lower MSE
-            improved = mse < best_mse
-            if improved.any():
-                best_q[improved] = q[improved]
-                best_scale[improved] = scale[improved]
-                best_mse[improved] = mse[improved]
-
-    return best_q, best_scale
 
 
 def _classify_param(name: str) -> str:
@@ -462,26 +425,15 @@ def mixed_quantize_int567(state_dict: dict[str, Tensor], int_cats: set[str],
             meta[name] = "passthrough_fp16"
             continue
         if cat in int_cats and t.ndim >= 1:
-            layer_idx = _get_layer_index(name)
-            if cat == "mlp":
-                clip = 15  # int5
-                label = "int5"
-            elif cat == "attn" and layer_idx >= int7_layer_start:
-                clip = 63  # int7 for XSA layers
-                label = "int7"
-            else:
-                clip = 31  # int6 for standard attention
-                label = "int6"
-            q, s = quantize_intN_per_row(t, clip_range=clip)
+            q, s = quantize_int6_per_row(t)
             result[name + ".q"] = q
             result[name + ".scale"] = s
-            meta[name] = {"type": label}
+            meta[name] = {"type": "int6"}
         else:
-            # Fallback: use GPTQ-lite int8
-            q, s = quantize_intN_per_row(t, clip_range=127)
+            q, s = quantize_int6_per_row(t)
             result[name + ".q"] = q
             result[name + ".scale"] = s
-            meta[name] = {"type": "int8"}
+            meta[name] = {"type": "int6"}
     return result, meta
 
 
