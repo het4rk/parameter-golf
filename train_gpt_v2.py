@@ -64,7 +64,7 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 10))
+    num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -378,7 +378,7 @@ def quantize_intN_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tens
     return q, scale
 
 
-def quantize_intN_per_row_gptq_lite(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
+def quantize_intN_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
     """GPTQ-lite: For each row, try multiple clip percentiles and pick the one with minimum MSE.
     This is zero cost during training, small cost during export."""
     t32 = t.float()
@@ -472,13 +472,13 @@ def mixed_quantize_int567(state_dict: dict[str, Tensor], int_cats: set[str],
             else:
                 clip = 31  # int6 for standard attention
                 label = "int6"
-            q, s = quantize_intN_per_row_gptq_lite(t, clip_range=clip)
+            q, s = quantize_intN_per_row(t, clip_range=clip)
             result[name + ".q"] = q
             result[name + ".scale"] = s
             meta[name] = {"type": label}
         else:
             # Fallback: use GPTQ-lite int8
-            q, s = quantize_intN_per_row_gptq_lite(t, clip_range=127)
+            q, s = quantize_intN_per_row(t, clip_range=127)
             result[name + ".q"] = q
             result[name + ".scale"] = s
             meta[name] = {"type": "int8"}
