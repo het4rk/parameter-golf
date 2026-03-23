@@ -1023,12 +1023,7 @@ def eval_val_sliding(
 def ttt_adapt(args: Hyperparameters, base_model: nn.Module, device: torch.device,
               val_tokens: Tensor, rank: int = 0, world_size: int = 1,
               log_fn=None) -> None:
-    """Frontier TTT: importance-weighted adaptation with discriminative LR.
-    Novel contributions over PR #442 baseline:
-    1. Importance weighting: upweight hard tokens in loss (importance sampling)
-    2. Discriminative LR: deeper layers get higher LR (they benefit most from adaptation)
-    3. Cosine LR decay across TTT epochs (prevents overshooting in later epochs)
-    """
+    """Full-weight AdamW adaptation on validation data (PR #442 recipe)."""
     seq_len = args.train_seq_len
     total_seqs = (val_tokens.numel() - 1) // seq_len
     batch_seqs = args.ttt_batch_seqs
@@ -1041,25 +1036,8 @@ def ttt_adapt(args: Hyperparameters, base_model: nn.Module, device: torch.device
                     p.requires_grad_(False)
                     frozen_params.add(id(p))
 
-    # Discriminative LR: deeper layers get higher LR
-    num_blocks = len(base_model.blocks)
-    param_groups = []
-    for i, block in enumerate(base_model.blocks):
-        block_params = [p for p in block.parameters() if p.requires_grad]
-        if block_params:
-            depth_ratio = (i + 1) / num_blocks  # 0.09 for layer 0, 1.0 for last layer
-            layer_lr = args.ttt_lr * (0.3 + 0.7 * depth_ratio)  # range: 0.3x to 1.0x base LR
-            param_groups.append({"params": block_params, "lr": layer_lr})
-    # Non-block params (embeddings, norms, etc.) at base LR
-    block_param_ids = set()
-    for block in base_model.blocks:
-        for p in block.parameters():
-            block_param_ids.add(id(p))
-    other_params = [p for p in base_model.parameters() if p.requires_grad and id(p) not in block_param_ids]
-    if other_params:
-        param_groups.append({"params": other_params, "lr": args.ttt_lr * 0.5})
-
-    optimizer = torch.optim.AdamW(param_groups, weight_decay=0.0)
+    ttt_params = [p for p in base_model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(ttt_params, lr=args.ttt_lr, weight_decay=0.0)
 
     my_start = (total_seqs * rank) // world_size
     my_end = (total_seqs * (rank + 1)) // world_size
@@ -1071,14 +1049,6 @@ def ttt_adapt(args: Hyperparameters, base_model: nn.Module, device: torch.device
         epoch_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
         epoch_tokens = torch.zeros((), device=device, dtype=torch.float64)
 
-        # Cosine LR decay across TTT epochs
-        epoch_frac = epoch / max(args.ttt_epochs - 1, 1)
-        lr_mul = 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * epoch_frac))
-        for pg in optimizer.param_groups:
-            pg["lr"] = pg.get("_base_lr", pg["lr"]) * lr_mul
-            if "_base_lr" not in pg:
-                pg["_base_lr"] = pg["lr"] / lr_mul  # save base LR on first epoch
-
         for batch_start in range(my_start, my_end, batch_seqs):
             batch_end = min(batch_start + batch_seqs, my_end)
             raw_start = batch_start * seq_len
@@ -1089,28 +1059,15 @@ def ttt_adapt(args: Hyperparameters, base_model: nn.Module, device: torch.device
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                # Importance-weighted TTT: compute per-token loss, then reweight
-                logits = base_model.forward_logits(x)
-                per_token_nll = F.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)).float(),
-                    y.reshape(-1), reduction="none"
-                )
-                # Importance weights: upweight hard tokens (high loss)
-                with torch.no_grad():
-                    weights = (per_token_nll / (per_token_nll.mean() + 1e-8)).clamp(0.2, 5.0)
-                    weights = weights / weights.mean()  # normalize so mean weight = 1
-                loss = (weights * per_token_nll).mean()
+                loss = base_model(x, y)
             loss.backward()
 
             if world_size > 1:
-                for pg in optimizer.param_groups:
-                    for p in pg["params"]:
-                        if p.grad is not None:
-                            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                for p in ttt_params:
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
 
-            torch.nn.utils.clip_grad_norm_(
-                [p for pg in optimizer.param_groups for p in pg["params"]], 1.0
-            )
+            torch.nn.utils.clip_grad_norm_(ttt_params, 1.0)
             optimizer.step()
 
             epoch_loss_sum += loss.detach().to(torch.float64) * y.numel()
