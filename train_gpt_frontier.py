@@ -960,17 +960,17 @@ def ttt_adapt(
                 for p in block.parameters():
                     p.requires_grad_(False)
 
-    # Per-layer LR groups by quantization sensitivity (PR #481 technique)
-    # MLP output projections suffer most from int6 quantization -> 3x LR
-    # MLP input projections -> 0.5x LR
+    # Per-layer LR groups by quantization sensitivity
+    # MLP down_proj (output) suffers most from int6 quantization -> 3x LR
+    # MLP up_proj (input) -> 0.5x LR
     # Everything else -> 1x LR
     param_groups = []
     for name, p in base_model.named_parameters():
         if not p.requires_grad:
             continue
-        if 'down_proj' in name or 'proj' in name and 'mlp' in name:
+        if '.mlp.down_proj.' in name:
             param_groups.append({"params": [p], "lr": args.ttt_lr * 3.0})
-        elif 'up_proj' in name or 'gate_proj' in name or ('fc' in name and 'mlp' in name):
+        elif '.mlp.up_proj.' in name or '.mlp.gate_proj.' in name:
             param_groups.append({"params": [p], "lr": args.ttt_lr * 0.5})
         else:
             param_groups.append({"params": [p], "lr": args.ttt_lr})
