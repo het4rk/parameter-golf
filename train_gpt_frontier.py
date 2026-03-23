@@ -113,7 +113,7 @@ class Hyperparameters:
     # TTT: SGD fine-tune on val data after training
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lr = float(os.environ.get("TTT_LR", "0.0005"))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", "20"))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", "10"))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 0))
