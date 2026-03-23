@@ -1458,6 +1458,14 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
+    # Magnitude pruning: zero 3% smallest weights for better compression
+    with torch.no_grad():
+        for name, param in base_model.named_parameters():
+            if param.ndim == 2 and param.numel() > 65536:
+                threshold = torch.quantile(param.abs().float().flatten(), 0.03)
+                param.masked_fill_(param.abs() < threshold, 0.0)
+    log0("magnitude_pruning: zeroed 3% smallest weights")
+
     quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
