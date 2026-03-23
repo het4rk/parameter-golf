@@ -31,11 +31,16 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch._dynamo
+torch._dynamo.config.optimize_ddp = False  # Required for PyTorch 2.4 DDP+compile
 
 try:
     from flash_attn_interface import flash_attn_func as flash_attn_3_func
 except ImportError:
-    from flash_attn import flash_attn_func as flash_attn_3_func
+    try:
+        from flash_attn import flash_attn_func as flash_attn_3_func
+    except ImportError:
+        flash_attn_3_func = None  # Fallback to PyTorch SDPA
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -670,7 +675,18 @@ class CausalSelfAttention(nn.Module):
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
         fa_dtype = torch.bfloat16
-        y = flash_attn_3_func(q.to(fa_dtype), k.to(fa_dtype), v.to(fa_dtype), causal=True)
+        if flash_attn_3_func is not None:
+            y = flash_attn_3_func(q.to(fa_dtype), k.to(fa_dtype), v.to(fa_dtype), causal=True)
+        else:
+            # Fallback to PyTorch SDPA (slower but works without flash-attn)
+            qt = q.to(fa_dtype).transpose(1, 2)
+            kt = k.to(fa_dtype).transpose(1, 2)
+            vt = v.to(fa_dtype).transpose(1, 2)
+            if self.num_kv_heads != self.num_heads:
+                rep = self.num_heads // self.num_kv_heads
+                kt = kt[:, :, None, :, :].expand(-1, -1, rep, -1, -1).reshape(bsz, self.num_heads, seqlen, self.head_dim)
+                vt = vt[:, :, None, :, :].expand(-1, -1, rep, -1, -1).reshape(bsz, self.num_heads, seqlen, self.head_dim)
+            y = F.scaled_dot_product_attention(qt, kt, vt, is_causal=True).transpose(1, 2)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
